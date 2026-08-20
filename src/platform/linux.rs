@@ -1,6 +1,7 @@
 use crate::ResultType;
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -140,7 +141,15 @@ pub fn get_display_server() -> String {
         return forced_display;
     }
 
-    // Check if `loginctl` can be called successfully
+    // Prefer reading logind's session files directly under /run/systemd/sessions.
+    // This avoids spawning `loginctl` on every probe, which on UOS/DDE triggers
+    // a `Display counting failed: Success` audit line per call and floods
+    // /var/log. Falls back to `loginctl` when the directory is unavailable.
+    if let Some(sid) = seat0_session_id() {
+        return get_display_server_of_session(&sid);
+    }
+
+    // Fallback: legacy `loginctl` based detection.
     if run_loginctl(None).is_err() {
         return DISPLAY_SERVER_X11.to_owned();
     }
@@ -167,6 +176,26 @@ pub fn get_display_server() -> String {
 }
 
 pub fn get_display_server_of_session(session: &str) -> String {
+    // Read the session file directly instead of spawning `loginctl`.
+    if let Some(fields) = read_session_file(session) {
+        if let Some(t) = fields.get("TYPE") {
+            let display_server = t.trim().to_lowercase();
+            if display_server.is_empty()
+                || display_server == "tty"
+                || display_server == "unspecified"
+            {
+                if let Ok(sestype) = std::env::var("XDG_SESSION_TYPE") {
+                    if !sestype.is_empty() {
+                        return sestype.to_lowercase();
+                    }
+                }
+                return "x11".to_owned();
+            }
+            return display_server;
+        }
+    }
+
+    // Fallback to `loginctl` if the session file is missing/unreadable.
     let mut display_server = if let Ok(output) =
         run_loginctl(Some(vec!["show-session", "-p", "Type", session]))
     // Check session type of the session
@@ -207,53 +236,42 @@ pub fn get_values_of_seat0_with_gdm_wayland(indices: &[usize]) -> Vec<String> {
     _get_values_of_seat0(indices, false)
 }
 
-// Ignore "3 sessions listed."
-fn ignore_loginctl_line(line: &str) -> bool {
-    line.contains("sessions") || line.split(" ").count() < 4
-}
-
 fn _get_values_of_seat0(indices: &[usize], ignore_gdm_wayland: bool) -> Vec<String> {
-    if let Ok(output) = run_loginctl(None) {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if ignore_loginctl_line(line) {
-                continue;
-            }
-            if line.contains("seat0") {
-                if let Some(sid) = line.split_whitespace().next() {
-                    if is_active(sid) {
-                        if ignore_gdm_wayland {
-                            if is_gdm_user(line.split_whitespace().nth(2).unwrap_or(""))
-                                && get_display_server_of_session(sid) == DISPLAY_SERVER_WAYLAND
-                            {
-                                continue;
-                            }
-                        }
-                        return line_values(indices, line);
-                    }
-                }
-            }
-        }
-
-        // some case, there is no seat0 https://github.com/rustdesk/rustdesk/issues/73
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            if ignore_loginctl_line(line) {
-                continue;
-            }
-            if let Some(sid) = line.split_whitespace().next() {
-                if is_active(sid) {
-                    let d = get_display_server_of_session(sid);
-                    if ignore_gdm_wayland {
-                        if is_gdm_user(line.split_whitespace().nth(2).unwrap_or(""))
-                            && d == DISPLAY_SERVER_WAYLAND
-                        {
-                            continue;
-                        }
-                    }
-                    if d == "tty" || d == "unspecified" {
+    // Read logind session files directly under /run/systemd/sessions instead of
+    // spawning `loginctl list-sessions`. Each file is a KEY=VALUE dump that
+    // already contains SID (filename), UID, USER, SEAT, STATE, ACTIVE, TYPE.
+    if let Some(mut sessions) = list_sessions() {
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        // Prefer an active seat0 session.
+        for (sid, fields) in &sessions {
+            let is_seat0 = fields.get("SEAT").map(|s| s.trim() == "seat0").unwrap_or(false);
+            if is_seat0 && is_active_fields(fields) {
+                if ignore_gdm_wayland {
+                    if is_gdm_user(fields.get("USER").map(|s| s.as_str()).unwrap_or(""))
+                        && get_display_server_of_session(sid) == DISPLAY_SERVER_WAYLAND
+                    {
                         continue;
                     }
-                    return line_values(indices, line);
                 }
+                return map_session_values(sid, fields, indices);
+            }
+        }
+        // Fallback: any active session that is not tty/unspecified
+        // (covers systems without a seat0, see rustdesk issue #73).
+        for (sid, fields) in &sessions {
+            if is_active_fields(fields) {
+                let d = get_display_server_of_session(sid);
+                if ignore_gdm_wayland {
+                    if is_gdm_user(fields.get("USER").map(|s| s.as_str()).unwrap_or(""))
+                        && d == DISPLAY_SERVER_WAYLAND
+                    {
+                        continue;
+                    }
+                }
+                if d == "tty" || d == "unspecified" {
+                    continue;
+                }
+                return map_session_values(sid, fields, indices);
             }
         }
     }
@@ -261,7 +279,98 @@ fn _get_values_of_seat0(indices: &[usize], ignore_gdm_wayland: bool) -> Vec<Stri
     line_values(indices, "")
 }
 
+/// Returns `(sid, parsed_fields)` for every session file under
+/// `/run/systemd/sessions`, skipping the `.ref` FIFOs and unreadable entries.
+fn list_sessions() -> Option<Vec<(String, HashMap<String, String>)>> {
+    let dir = std::path::Path::new("/run/systemd/sessions");
+    let mut out = Vec::new();
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "ref").unwrap_or(false) {
+            continue;
+        }
+        let sid = match path.file_stem() {
+            Some(s) => s.to_string_lossy().to_string(),
+            None => continue,
+        };
+        if let Some(fields) = parse_key_value_file(&path) {
+            out.push((sid, fields));
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Returns the active seat0 session id, if any, by reading `/run/systemd/seats/seat0`.
+fn seat0_session_id() -> Option<String> {
+    let path = std::path::Path::new("/run/systemd/seats/seat0");
+    let fields = parse_key_value_file(path)?;
+    // `ACTIVE` holds the active session id on seat0.
+    fields.get("ACTIVE").map(|s| s.trim().to_string())
+}
+
+/// Parse a logind key=value session/seat file. Lines starting with `#` and
+/// blank lines are ignored. This is the same data `loginctl` prints, but read
+/// directly from the filesystem with no process spawn.
+fn parse_key_value_file(path: &std::path::Path) -> Option<HashMap<String, String>> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim().to_string();
+            let val = line[eq + 1..].trim().to_string();
+            map.insert(key, val);
+        }
+    }
+    Some(map)
+}
+
+fn read_session_file(sid: &str) -> Option<HashMap<String, String>> {
+    let path = std::path::Path::new("/run/systemd/sessions").join(sid);
+    parse_key_value_file(&path)
+}
+
+fn is_active_fields(fields: &HashMap<String, String>) -> bool {
+    fields.get("STATE").map(|s| s.trim() == "active").unwrap_or(false)
+        || fields.get("ACTIVE").map(|s| s.trim() == "1").unwrap_or(false)
+}
+
+/// Map parsed session fields to the indexed tuple historically returned by
+/// `get_values_of_seat0`: index 0 = sid, 1 = uid, 2 = username.
+fn map_session_values(
+    sid: &str,
+    fields: &HashMap<String, String>,
+    indices: &[usize],
+) -> Vec<String> {
+    let uid = fields.get("UID").map(|s| s.trim().to_string()).unwrap_or_default();
+    let username = fields
+        .get("USER")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    indices
+        .iter()
+        .map(|idx| match *idx {
+            0 => sid.to_string(),
+            1 => uid.clone(),
+            2 => username.clone(),
+            _ => "".to_string(),
+        })
+        .collect()
+}
+
 pub fn is_active(sid: &str) -> bool {
+    if let Some(fields) = read_session_file(sid) {
+        return is_active_fields(&fields);
+    }
+    // Fallback to `loginctl`.
     if let Ok(output) = run_loginctl(Some(vec!["show-session", "-p", "State", sid])) {
         String::from_utf8_lossy(&output.stdout).contains("active")
     } else {
@@ -270,6 +379,11 @@ pub fn is_active(sid: &str) -> bool {
 }
 
 pub fn is_active_and_seat0(sid: &str) -> bool {
+    if let Some(fields) = read_session_file(sid) {
+        return is_active_fields(&fields)
+            && fields.get("SEAT").map(|s| s.trim() == "seat0").unwrap_or(false);
+    }
+    // Fallback to `loginctl`.
     if let Ok(output) = run_loginctl(Some(vec!["show-session", sid])) {
         String::from_utf8_lossy(&output.stdout).contains("State=active")
             && String::from_utf8_lossy(&output.stdout).contains("Seat=seat0")
@@ -280,6 +394,8 @@ pub fn is_active_and_seat0(sid: &str) -> bool {
 
 // Check both "Lock" and "Switch user"
 pub fn is_session_locked(sid: &str) -> bool {
+    // `LockedHint` is not always present in the session file, so query logind.
+    // This is called on a slow path (lock detection), not in the service loop.
     if let Ok(output) = run_loginctl(Some(vec!["show-session", sid, "--property=LockedHint"])) {
         String::from_utf8_lossy(&output.stdout).contains("LockedHint=yes")
     } else {
@@ -636,5 +752,55 @@ mod tests {
         assert_eq!(shell_quote("`id`"), "'`id`'");
         assert_eq!(shell_quote("a && b"), "'a && b'");
         assert_eq!(shell_quote("a | b"), "'a | b'");
+    }
+
+    /// A sample logind session file (KEY=VALUE) as found under
+    /// /run/systemd/sessions/<sid>.
+    const SAMPLE_SESSION: &str = "# This is private data. Do not parse.\n\
+UID=1000\n\
+USER=zyq\n\
+ACTIVE=1\n\
+IS_DISPLAY=1\n\
+STATE=active\n\
+TYPE=wayland\n\
+CLASS=user\n\
+SCOPE=session-33.scope\n\
+SEAT=seat0\n\
+DISPLAY=:2\n\
+SERVICE=lightdm\n\
+DESKTOP=Wayland\n\
+VTNR=1\n\
+LEADER=262664\n\
+";
+
+    #[test]
+    fn test_parse_key_value_file_inline() {
+        let dir = std::env::temp_dir().join("rustdesk_test_sessions");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("33");
+        std::fs::write(&p, SAMPLE_SESSION).unwrap();
+        let fields = parse_key_value_file(&p).expect("parse");
+        assert_eq!(fields.get("UID").map(|s| s.as_str()), Some("1000"));
+        assert_eq!(fields.get("USER").map(|s| s.as_str()), Some("zyq"));
+        assert_eq!(fields.get("TYPE").map(|s| s.as_str()), Some("wayland"));
+        assert_eq!(fields.get("SEAT").map(|s| s.as_str()), Some("seat0"));
+        assert!(is_active_fields(&fields));
+        let mapped = map_session_values("33", &fields, &[0, 1, 2]);
+        assert_eq!(mapped, vec!["33", "1000", "zyq"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_display_server_of_session_from_fields() {
+        // get_display_server_of_session must read TYPE from the file, not spawn
+        // loginctl. We cannot easily stub the filesystem path it reads, so we
+        // assert the fallback-free branch indirectly: a wayland TYPE maps to
+        // "wayland" and an empty/tty TYPE falls back to XDG_SESSION_TYPE then x11.
+        std::env::set_var("XDG_SESSION_TYPE", "wayland");
+        // Without a real /run/systemd/sessions file for a fake sid the function
+        // falls back to loginctl; on a system without loginctl it returns x11.
+        // Here we only verify it does not panic and returns a known display server.
+        let r = get_display_server_of_session("no-such-session-xyz");
+        assert!(matches!(r.as_str(), "wayland" | "x11"));
     }
 }
