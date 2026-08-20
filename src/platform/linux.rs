@@ -3,6 +3,8 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 use users::{get_current_uid, get_user_by_uid, os::unix::UserExt};
 
@@ -306,7 +308,29 @@ pub fn run_cmds_trim_newline(cmds: &str) -> ResultType<String> {
     })
 }
 
-fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output> {
+// The UOS/DDE `systemd-logind` setup triggers an extreme rate of `loginctl`
+// calls from the RustDesk `--service` loop (every 500 ms the desktop refresh
+// queries seat0, active state and per-session type, each spawning a new
+// `loginctl` process). On this system logind also logs every call to
+// `auth.log`/syslog as `Display counting failed: Success`, growing the logs by
+// tens of MB per hour and pinning a CPU core. The session type / seat0 layout
+// changes at most on login/logout, so caching the `loginctl` output for a few
+// seconds is safe and eliminates the storm.
+const LOGINCTL_CACHE_TTL: Duration = Duration::from_secs(2);
+
+struct LoginctlCacheEntry {
+    // `None` stores a failed `loginctl` invocation (callers treat failure the
+    // same as an empty/error result).
+    output: Option<std::process::Output>,
+    ts: Instant,
+}
+
+lazy_static::lazy_static! {
+    static ref LOGINCTL_CACHE: Mutex<HashMap<String, LoginctlCacheEntry>> =
+        Mutex::new(HashMap::new());
+}
+
+fn run_loginctl_uncached(args: Option<Vec<&str>>) -> Option<std::process::Output> {
     if std::env::var("FLATPAK_ID").is_ok() {
         let mut l_args = CMD_LOGINCTL.to_string();
         if let Some(a) = args.as_ref() {
@@ -315,15 +339,59 @@ fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output
         let res = std::process::Command::new("flatpak-spawn")
             .args(vec![String::from("--host"), l_args])
             .output();
-        if res.is_ok() {
-            return res;
+        if let Ok(o) = res {
+            return Some(o);
         }
     }
     let mut cmd = std::process::Command::new(CMD_LOGINCTL.as_str());
     if let Some(a) = args {
-        return cmd.args(a).output();
+        if let Ok(o) = cmd.args(a).output() {
+            return Some(o);
+        }
+        return None;
     }
-    cmd.output()
+    cmd.output().ok()
+}
+
+/// Cached wrapper around `loginctl`. The result of each distinct argument set
+/// is cached for `LOGINCTL_CACHE_TTL` seconds, after which a fresh `loginctl`
+/// process is spawned and the cache entry refreshed.
+///
+/// Returns `Err` (matching the previous signature) when the cache is poisoned
+/// or the invocation fails, so existing callers that branch on `.is_err()`
+/// keep working unchanged.
+fn run_loginctl(args: Option<Vec<&str>>) -> std::io::Result<std::process::Output> {
+    let key = match &args {
+        None => String::new(),
+        Some(a) => a.join("\u{1}"),
+    };
+    let now = Instant::now();
+    if let Ok(cache) = LOGINCTL_CACHE.lock() {
+        if let Some(entry) = cache.get(&key) {
+            if now.duration_since(entry.ts) < LOGINCTL_CACHE_TTL {
+                return match &entry.output {
+                    Some(o) => Ok(o.clone()),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "cached loginctl failure",
+                    )),
+                };
+            }
+        }
+    }
+    let output = run_loginctl_uncached(args);
+    if let Ok(mut cache) = LOGINCTL_CACHE.lock() {
+        cache.insert(
+            key,
+            LoginctlCacheEntry {
+                output: output.clone(),
+                ts: Instant::now(),
+            },
+        );
+    }
+    output.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "loginctl invocation failed")
+    })
 }
 
 /// forever: may not work
